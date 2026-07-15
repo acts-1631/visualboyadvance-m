@@ -15,6 +15,11 @@
 #endif
 
 #include <stdio.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <thread>
 #include <wx/cmdline.h>
 #include <wx/display.h>
 #include <wx/file.h>
@@ -624,6 +629,55 @@ wxString wxvbamApp::GetAbsolutePath(wxString path)
 int language = wxLANGUAGE_DEFAULT;
 wxLocale *wxvbam_locale = NULL;
 
+// First-launch heuristic for the default xBRZ scale. Runs a very brief
+// single-thread integer benchmark (a few milliseconds) whose result is scaled
+// by the number of cores the filter can actually use -- the xBRZ filter runs
+// multi-threaded, capped at 8 threads, so only that many cores contribute
+// (which also keeps huge-core-count VMs with slow cores from over-scoring). A
+// higher combined score selects a larger scale; anything short of "clearly
+// capable" falls back to the safe 2x. The thresholds are heuristic; tune on
+// real hardware if needed.
+static config::Filter ProbeDefaultXbrzFilter() {
+    constexpr int kIters = 300000;
+    double best_ms = 1e30;
+    for (int rep = 0; rep < 8; ++rep) {
+        uint32_t acc = 0x9E3779B9u + static_cast<uint32_t>(rep);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIters; ++i) {
+            // xBRZ-like per-pixel integer color-distance work.
+            acc ^= acc << 13; acc ^= acc >> 17; acc ^= acc << 5;
+            const uint32_t b = acc * 2654435761u;
+            const int dr = int((acc >> 16) & 0xFF) - int((b >> 16) & 0xFF);
+            const int dg = int((acc >>  8) & 0xFF) - int((b >>  8) & 0xFF);
+            const int db = int( acc        & 0xFF) - int( b        & 0xFF);
+            acc += static_cast<uint32_t>((dr < 0 ? -dr : dr) * 2 +
+                                         (dg < 0 ? -dg : dg) * 4 +
+                                         (db < 0 ? -db : db) * 3);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        // Keep the loop from being optimized away, and take the fastest rep so
+        // an occasional scheduling hiccup doesn't make a fast CPU look slow.
+        static volatile uint32_t sink; sink = acc; (void)sink;
+        best_ms = std::min(best_ms, ms);
+    }
+
+    // Single-core throughput, in benchmark iterations per millisecond.
+    const double per_core = best_ms > 0.0 ? kIters / best_ms : 0.0;
+    unsigned cores = std::thread::hardware_concurrency();
+    if (cores == 0)
+        cores = 1;
+    const double combined = per_core * std::min(cores, 8u);
+
+    // Require both decent single-core speed and enough combined throughput
+    // before committing to an expensive scale.
+    if (per_core >= 700000.0 && combined >= 6000000.0)
+        return config::Filter::kXbrz9x;
+    if (per_core >= 400000.0 && combined >= 2000000.0)
+        return config::Filter::kXbrz6x;
+    return config::Filter::kXbrz2x;
+}
+
 bool wxvbamApp::OnInit() {
 #ifndef NO_WAYLAND
     using_wayland = IsWayland();
@@ -771,7 +825,18 @@ bool wxvbamApp::OnInit() {
     }
 
     // Load the default options.
-    load_opts(!config_file_.Exists());
+    const bool first_run = !config_file_.Exists();
+    load_opts(first_run);
+
+#if !defined(WINXP)
+    // On first launch only (no config file yet), pick the default xBRZ scale
+    // from a quick CPU probe and persist it. This never overrides a filter the
+    // user has explicitly chosen -- it runs solely when there was no config.
+    // WINXP builds keep their no-filter default (older CPUs lack the SIMD xBRZ
+    // needs), so they are excluded.
+    if (first_run)
+        OPTION(kDispFilter) = ProbeDefaultXbrzFilter();
+#endif
 
     if (wxvbam_locale)
         wxDELETE(wxvbam_locale);
